@@ -4,10 +4,11 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import warnings
+from collections.abc import Iterable
 
 import numpy as np
-import pandas as pd
 from scipy import sparse
+from scipy.stats.mstats import mquantiles
 
 from ..base import is_classifier, is_regressor
 from ..utils import Bunch, _safe_indexing, check_array
@@ -19,13 +20,90 @@ from ..utils._param_validation import (
     StrOptions,
     validate_params,
 )
+from ..utils.extmath import cartesian
 from ..utils.validation import _check_sample_weight, check_is_fitted
-from ._partial_dependence import _grid_from_X, _partial_dependence_brute
+from ._partial_dependence import _partial_dependence_brute
 from ._pd_utils import _check_feature_names, _get_feature_index
 
 __all__ = [
     "accumulated_local_effect",
 ]
+
+def _grid_from_X(X, features, is_categorical, grid_resolution):
+    """Generate a grid of points based on the percentiles of X.
+
+    The grid is a cartesian product between the columns of ``values``. The
+    ith column of ``values`` consists in ``grid_resolution`` equally-spaced
+    quantile of the distribution of jth column of X.
+
+    If ``grid_resolution`` is bigger than the number of unique values in the
+    j-th column of X or if the feature is a categorical feature (by inspecting
+    `is_categorical`) , then those unique values will be used instead.
+
+    Parameters
+    ----------
+    X : array-like of shape (n_samples, n_target_features)
+        The data.
+
+    is_categorical : list of bool
+        For each feature, tells whether it is categorical or not. If a feature
+        is categorical, then the values used will be the unique ones
+        (i.e. categories) instead of the percentiles.
+
+    grid_resolution : int
+        The number of equally spaced points to be placed on the grid for each
+        feature.
+
+    Returns
+    -------
+    grid : ndarray of shape (n_points, n_target_features)
+        A value for each feature at each point in the grid. ``n_points`` is
+        always ``<= grid_resolution ** X.shape[1]``.
+
+    values : list of 1d ndarrays
+        The values with which the grid has been created. The size of each
+        array ``values[j]`` is either ``grid_resolution``, the number of
+        unique values in ``X[:, j]``, if j is not in ``custom_range``.
+        If j is in ``custom_range``, then it is the length of ``custom_range[j]``.
+    """
+    if grid_resolution <= 1:
+        raise ValueError("'grid_resolution' must be strictly greater than 1.")
+
+    values = []
+    indexes = []
+    # TODO: we should handle missing values (i.e. `np.nan`) specifically and store them
+    # in a different Bunch attribute.
+    for feature_idx, is_cat in enumerate(is_categorical):
+        try:
+            uniques = np.unique(_safe_indexing(X, feature_idx, axis=1))
+        except TypeError as exc:
+            # `np.unique` will fail in the presence of `np.nan` and `str` categories
+            # due to sorting. Temporary, we reraise an error explaining the problem.
+            raise ValueError(
+                f"The column #{feature_idx} contains mixed data types. Finding unique "
+                "categories fail due to sorting. It usually means that the column "
+                "contains `np.nan` values together with `str` categories. Such use "
+                "case is not yet supported in scikit-learn."
+            ) from exc
+
+        if is_cat or uniques.shape[0] < grid_resolution:
+            # Use the unique values either because:
+            # - feature has low resolution use unique values
+            # - feature is categorical
+            axis = uniques
+        else:
+            # create axis based on percentiles and grid resolution
+            axis = np.unique(
+                mquantiles(
+                    _safe_indexing(X, feature_idx, axis=1),
+                    prob=np.linspace(0., 1., grid_resolution), axis=0)
+            )
+        values.append(axis)
+        indexes.append( np.clip(
+                np.digitize(X[features[feature_idx]], axis, right=True) - 1, 0, None
+            ))
+
+    return values, indexes
 
 @validate_params(
     {
@@ -177,6 +255,7 @@ def accumulated_local_effect(
     ...                    grid_resolution=2) # doctest: +SKIP
     (array([[-4.52...,  4.52...]]), [array([ 0.,  1.])])
     """
+    ##################################### DUPLICATED FROM PDP ##########################
     check_is_fitted(estimator)
 
     if not (is_classifier(estimator) or is_regressor(estimator)):
@@ -245,11 +324,13 @@ def accumulated_local_effect(
     custom_values = custom_values or {}
     if isinstance(features, (str, int)):
         features = [features]
+    ##################################### DUPLICATED FROM PDP ##########################
 
     warning_integer = False
     ale_results = Bunch(ale=[], quantile=[], center_quantile=[], mean_effect=[])
+    quantiles, indices = _grid_from_X(X, features, is_categorical, grid_resolution)
     for feature_idx, feature, is_cat in zip(features_indices, features, is_categorical):
-        if warning_integer and _safe_indexing(X, feature_idx, axis=1).dtype.kind in "iu":
+        if not warning_integer and _safe_indexing(X, feature_idx, axis=1).dtype.kind in "iu":
             # TODO(1.9): raise a ValueError instead.
             warnings.warn(
                 f"The column {feature!r} contains integer data. Partial "
@@ -261,28 +342,28 @@ def accumulated_local_effect(
                 FutureWarning,
             )
             # Do not warn again for other features to avoid spamming the caller.
+            warning_integer = True
             break
-        if not is_cat:
-            quantile = np.unique(
-                np.quantile(
-                    X[feature], np.linspace(0, 1, grid_resolution + 1), interpolation="lower"
-                )
-            )
-            indices = np.clip(
-                np.digitize(X[feature], quantile, right=True) - 1, 0, None
-            )
-
+        # code partially copy from ALEpython (https://github.com/blent-ai/ALEPython/blob/dev/src/alepython/ale.py)
+        quantile = quantiles[feature_idx]
+        indice = indices[feature_idx]
         averaged_predictions, predictions = _partial_dependence_brute(
-            estimator, [[quantile[indices]],[quantile[indices + 1]]], [feature_idx], X, response_method, sample_weight
+            estimator, [[quantile[indice]], [quantile[indice + 1]]], [feature_idx], X, response_method, sample_weight
         )
+        # The individual effects.
         effects = np.diff(predictions)
         # Average these differences within each bin.
-        mean_effect = [np.mean(effects[np.where(indices == i)]) for i in np.unique(indices)]
-        size_index = [len(np.where(indices == i)[0]) for i in np.unique(indices)]
+        mean_effect = [np.mean(effects[np.where(indice == i)]) for i in np.unique(indice)]
+        size_index = [len(np.where(indice == i)[0]) for i in np.unique(indice)]
+        # The uncentred mean main effects at the bin centres.
         ale = np.array([0, *np.cumsum(mean_effect)])
         ale = (ale[1:] + ale[:-1]) / 2
-        centers_quantile = (quantile[1:] + quantile[:-1]) / 2
+        # Centre the effects by subtracting the mean (the mean of the individual
+        # `effects`, which is equivalently calculated using `mean_effects` and the number
+        # of samples in each bin).center the effects
         ale -= np.sum(ale * size_index / X.shape[0])
+
+        centers_quantile = (quantile[1:] + quantile[:-1]) / 2
 
         ale_results["ale"].append(ale)
         ale_results["quantile"].append(quantile)
