@@ -11,8 +11,8 @@ from ._plot.partial_dependence import PartialDependenceDisplay
 
 __all__ = [
     "accumulated_local_effect",
+    "DecisionBoundaryDisplay",
+    "PartialDependenceDisplay",
     "partial_dependence",
     "permutation_importance",
-    "PartialDependenceDisplay",
-    "DecisionBoundaryDisplay",
 ]
