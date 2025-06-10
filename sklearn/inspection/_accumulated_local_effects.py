@@ -4,7 +4,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import warnings
-from collections.abc import Iterable
 
 import numpy as np
 from scipy import sparse
@@ -20,7 +19,6 @@ from ..utils._param_validation import (
     StrOptions,
     validate_params,
 )
-from ..utils.extmath import cartesian
 from ..utils.validation import _check_sample_weight, check_is_fitted
 from ._partial_dependence import _partial_dependence_brute
 from ._pd_utils import _check_feature_names, _get_feature_index
@@ -75,7 +73,7 @@ def _grid_from_X(X, features, is_categorical, grid_resolution):
     # in a different Bunch attribute.
     for feature_idx, is_cat in enumerate(is_categorical):
         try:
-            uniques = np.unique(_safe_indexing(X, feature_idx, axis=1))
+            uniques = np.unique(_safe_indexing(X, features[feature_idx], axis=1))
         except TypeError as exc:
             # `np.unique` will fail in the presence of `np.nan` and `str` categories
             # due to sorting. Temporary, we reraise an error explaining the problem.
@@ -102,7 +100,6 @@ def _grid_from_X(X, features, is_categorical, grid_resolution):
         indexes.append( np.clip(
                 np.digitize(X[features[feature_idx]], axis, right=True) - 1, 0, None
             ))
-
     return values, indexes
 
 @validate_params(
@@ -329,7 +326,7 @@ def accumulated_local_effect(
     warning_integer = False
     ale_results = Bunch(ale=[], quantile=[], center_quantile=[], mean_effect=[])
     quantiles, indices = _grid_from_X(X, features, is_categorical, grid_resolution)
-    for feature_idx, feature, is_cat in zip(features_indices, features, is_categorical):
+    for index, (feature_idx, feature) in enumerate(zip(features_indices, features)):
         if not warning_integer and _safe_indexing(X, feature_idx, axis=1).dtype.kind in "iu":
             # TODO(1.9): raise a ValueError instead.
             warnings.warn(
@@ -345,10 +342,11 @@ def accumulated_local_effect(
             warning_integer = True
             break
         # code partially copy from ALEpython (https://github.com/blent-ai/ALEPython/blob/dev/src/alepython/ale.py)
-        quantile = quantiles[feature_idx]
-        indice = indices[feature_idx]
-        averaged_predictions, predictions = _partial_dependence_brute(
-            estimator, [[quantile[indice]], [quantile[indice + 1]]], [feature_idx], X, response_method, sample_weight
+        quantile = quantiles[index]
+        indice = indices[index]
+        _, predictions = _partial_dependence_brute(
+            estimator, [[quantile[indice]], [quantile[indice + 1]]], [feature_idx], X,
+            response_method, sample_weight
         )
         # The individual effects.
         effects = np.diff(predictions)
