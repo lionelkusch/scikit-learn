@@ -93,7 +93,7 @@ def _grid_from_X(X, features, is_categorical, grid_resolution):
             # create axis based on percentiles and grid resolution
             axis = np.unique(
                 mquantiles(
-                    _safe_indexing(X, feature_idx, axis=1),
+                    _safe_indexing(X, features[feature_idx], axis=1),
                     prob=np.linspace(0., 1., grid_resolution), axis=0)
             )
         values.append(axis)
