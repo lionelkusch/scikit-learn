@@ -27,7 +27,7 @@ __all__ = [
     "accumulated_local_effect",
 ]
 
-def _grid_from_X(X, features, is_categorical, grid_resolution):
+def _grid_from_X(X, features, is_categorical, grid_resolution, custom_values):
     """Generate a grid of points based on the percentiles of X.
 
     The grid is a cartesian product between the columns of ``values``. The
@@ -51,6 +51,10 @@ def _grid_from_X(X, features, is_categorical, grid_resolution):
     grid_resolution : int
         The number of equally spaced points to be placed on the grid for each
         feature.
+    
+    custom_values: dict
+        Mapping from column index of X to an array-like of values where
+        the partial dependence should be calculated for that feature
 
     Returns
     -------
@@ -66,40 +70,64 @@ def _grid_from_X(X, features, is_categorical, grid_resolution):
     """
     if grid_resolution <= 1:
         raise ValueError("'grid_resolution' must be strictly greater than 1.")
+    
+    def _convert_custom_values(values):
+        # Convert custom types such that object types are always used for string arrays
+        dtype = object if any(isinstance(v, str) for v in values) else None
+        return np.asarray(values, dtype=dtype)
+
+    custom_values = {k: _convert_custom_values(v) for k, v in custom_values.items()}
+    if any(v.ndim != 1 for v in custom_values.values()):
+        error_string = ", ".join(
+            f"Feature {k}: {v.ndim} dimensions"
+            for k, v in custom_values.items()
+            if v.ndim != 1
+        )
+
+        raise ValueError(
+            "The custom grid for some features is not a one-dimensional array. "
+            f"{error_string}"
+        )
 
     values = []
     indexes = []
     # TODO: we should handle missing values (i.e. `np.nan`) specifically and store them
     # in a different Bunch attribute.
     for feature_idx, is_cat in enumerate(is_categorical):
-        try:
-            uniques = np.unique(_safe_indexing(X, features[feature_idx], axis=1))
-        except TypeError as exc:
-            # `np.unique` will fail in the presence of `np.nan` and `str` categories
-            # due to sorting. Temporary, we reraise an error explaining the problem.
-            raise ValueError(
-                f"The column #{feature_idx} contains mixed data types. Finding unique "
-                "categories fail due to sorting. It usually means that the column "
-                "contains `np.nan` values together with `str` categories. Such use "
-                "case is not yet supported in scikit-learn."
-            ) from exc
-
-        if is_cat or uniques.shape[0] < grid_resolution:
-            # Use the unique values either because:
-            # - feature has low resolution use unique values
-            # - feature is categorical
-            axis = uniques
+        if feature in custom_values:
+            # Use values in the custom range
+            axis = custom_values[feature]
         else:
-            # create axis based on percentiles and grid resolution
-            axis = np.unique(
-                mquantiles(
-                    _safe_indexing(X, features[feature_idx], axis=1),
-                    prob=np.linspace(0., 1., grid_resolution), axis=0)
-            )
+            try:
+                uniques = np.unique(_safe_indexing(X, features[feature_idx], axis=1))
+            except TypeError as exc:
+                # `np.unique` will fail in the presence of `np.nan` and `str` categories
+                # due to sorting. Temporary, we reraise an error explaining the problem.
+                raise ValueError(
+                    f"The column #{feature_idx} contains mixed data types. Finding unique "
+                    "categories fail due to sorting. It usually means that the column "
+                    "contains `np.nan` values together with `str` categories. Such use "
+                    "case is not yet supported in scikit-learn."
+                ) from exc
+
+            if is_cat or uniques.shape[0] < grid_resolution:
+                # Use the unique values either because:
+                # - feature has low resolution use unique values
+                # - feature is categorical
+                axis = uniques
+            else:
+                # create axis based on percentiles and grid resolution
+                axis = np.unique(
+                    mquantiles(
+                        _safe_indexing(X, features[feature_idx], axis=1),
+                        prob=np.linspace(0., 1., grid_resolution+1), axis=0)
+                )
         values.append(axis)
         indexes.append( np.clip(
                 np.digitize(X[features[feature_idx]], axis, right=True) - 1, 0, None
             ))
+        print(values[-1], values[-1].shape, np.unique(axis).shape)
+        print(indexes[-1], indexes[-1].shape, np.unique(indexes[-1]).shape)
     return values, indexes
 
 @validate_params(
@@ -321,11 +349,43 @@ def accumulated_local_effect(
     custom_values = custom_values or {}
     if isinstance(features, (str, int)):
         features = [features]
+
+    for feature_idx, feature, is_cat in zip(features_indices, features, is_categorical):
+        if is_cat:
+            continue
+
+        if _safe_indexing(X, feature_idx, axis=1).dtype.kind in "iu":
+            # TODO(1.9): raise a ValueError instead.
+            warnings.warn(
+                f"The column {feature!r} contains integer data. Partial "
+                "dependence plots are not supported for integer data: this "
+                "can lead to implicit rounding with NumPy arrays or even errors "
+                "with newer pandas versions. Please convert numerical features"
+                "to floating point dtypes ahead of time to avoid problems. "
+                "This will raise ValueError in scikit-learn 1.9.",
+                FutureWarning,
+            )
+            # Do not warn again for other features to avoid spamming the caller.
+            break
+
+    X_subset = _safe_indexing(X, features_indices, axis=1)
+
+    custom_values_for_X_subset = {
+        index: custom_values.get(feature)
+        for index, feature in enumerate(features)
+        if feature in custom_values
+    }
     ##################################### DUPLICATED FROM PDP ##########################
+    quantiles, indices = _grid_from_X(
+        X_subset,
+        features,
+        is_categorical,
+        grid_resolution,
+        custom_values_for_X_subset
+    )
 
     warning_integer = False
     ale_results = Bunch(ale=[], quantile=[], center_quantile=[], mean_effect=[])
-    quantiles, indices = _grid_from_X(X, features, is_categorical, grid_resolution)
     for index, (feature_idx, feature) in enumerate(zip(features_indices, features)):
         if not warning_integer and _safe_indexing(X, feature_idx, axis=1).dtype.kind in "iu":
             # TODO(1.9): raise a ValueError instead.
