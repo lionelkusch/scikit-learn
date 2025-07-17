@@ -94,9 +94,9 @@ def _grid_from_X(X, features, is_categorical, grid_resolution, custom_values):
     # TODO: we should handle missing values (i.e. `np.nan`) specifically and store them
     # in a different Bunch attribute.
     for feature_idx, is_cat in enumerate(is_categorical):
-        if feature in custom_values:
+        if features[feature_idx] in custom_values:
             # Use values in the custom range
-            axis = custom_values[feature]
+            axis = custom_values[features[feature_idx]]
         else:
             try:
                 uniques = np.unique(_safe_indexing(X, features[feature_idx], axis=1))
